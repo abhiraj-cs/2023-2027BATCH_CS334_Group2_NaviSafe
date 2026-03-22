@@ -1,0 +1,625 @@
+'use client';
+
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import 'leaflet/dist/leaflet.css';
+import 'leaflet-defaulticon-compatibility/dist/leaflet-defaulticon-compatibility.css';
+import 'leaflet-defaulticon-compatibility';
+import 'leaflet-geosearch/dist/geosearch.css';
+import L from 'leaflet';
+import { OpenStreetMapProvider } from 'leaflet-geosearch';
+import { BlackSpot } from '@/lib/data';
+import { getSafetyBriefing } from '@/lib/actions';
+import { haversineDistance } from '@/lib/utils';
+import { TravelMode } from './navisafe-app';
+
+const COLLISION_THRESHOLD = 500; 
+const PROXIMITY_ALERT_THRESHOLD = 100; // meters
+
+// Helper function to create custom warning icons for black spots
+const createWarningIcon = (riskLevel: 'High' | 'Medium', reportCount: number) => {
+  const color = riskLevel === 'High' ? '#ef4444' : '#f97316'; // red-500, orange-500
+  const size = 24 + Math.min(reportCount, 5) * 4; // Base size 24, grows up to 44px
+
+  const iconHtml = `
+    <div style="filter: drop-shadow(0 2px 4px rgba(0,0,0,0.4));">
+      <svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24">
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" fill="${color}"></path>
+        <path d="M11 9h2v4h-2z" fill="white"></path>
+        <path d="M11 15h2v2h-2z" fill="white"></path>
+      </svg>
+    </div>
+  `;
+
+  return L.divIcon({
+    html: iconHtml,
+    className: '', // Use an empty class name to avoid default Leaflet styles
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size], // Anchor to the bottom-center point of the icon
+    popupAnchor: [0, -size], // Position popup above the icon
+  });
+};
+
+type NavigationUpdateData = {
+  speed: number;
+  remainingTime: number;
+  remainingDistance: number;
+};
+
+
+type MapProps = {
+  startLocation: string | { lat: number; lng: number };
+  endLocation: string;
+  stops: { lat: number, lng: number }[];
+  blackSpots: BlackSpot[];
+  travelMode: TravelMode;
+  locateUser: boolean;
+  panToStart: boolean;
+  isNavigating: boolean;
+  onSafetyBriefing: (briefing: string | null) => void;
+  onRouteDetails: (details: any | null) => void;
+  onMapError: (message: string) => void;
+  onLoading: (loading: boolean) => void;
+  onMapClick: (latlng: { lat: number, lng: number }) => void;
+  isAdmin: boolean;
+  onSpotDeleteRequest: (spot: BlackSpot) => void;
+  onRerouteInfo: (info: any | null) => void;
+  onNavigationUpdate: (data: NavigationUpdateData | null) => void;
+  onProximityAlert: (spot: BlackSpot) => void;
+};
+
+const primaryRouteStyle = { color: '#3b82f6', weight: 7, opacity: 0.9 };
+const alternativeRouteStyle = { color: '#9ca3af', weight: 5, opacity: 0.7 };
+
+const MapComponent = ({ 
+  startLocation, 
+  endLocation,
+  stops,
+  blackSpots,
+  travelMode,
+  locateUser,
+  panToStart,
+  isNavigating,
+  onSafetyBriefing, 
+  onRouteDetails,
+  onMapError,
+  onLoading,
+  onMapClick,
+  isAdmin,
+  onSpotDeleteRequest,
+  onRerouteInfo,
+  onNavigationUpdate,
+  onProximityAlert,
+}: MapProps) => {
+  const mapRef = useRef<HTMLDivElement>(null);
+  const leafletMap = useRef<L.Map | null>(null);
+  const routeLayers = useRef<L.LayerGroup | null>(null);
+  const startMarker = useRef<L.Marker | null>(null);
+  const endMarker = useRef<L.Marker | null>(null);
+  const blackSpotsLayer = useRef<L.LayerGroup | null>(null);
+  const stopsLayer = useRef<L.LayerGroup | null>(null);
+  const userLocationMarker = useRef<L.Marker | null>(null);
+  const lastPassedIndex = useRef(0);
+  const alertedSpotsRef = useRef<Set<string>>(new Set());
+
+  const [routes, setRoutes] = useState<any[]>([]);
+  const [selectedRouteIndex, setSelectedRouteIndex] = useState<number>(0);
+  
+  const selectedRoute = useMemo(() => routes[selectedRouteIndex], [routes, selectedRouteIndex]);
+  const totalHaversineDistance = useMemo(() => {
+    if (!selectedRoute) return 0;
+    const routeCoords = selectedRoute.geometry.coordinates.map((c: number[]) => ({ lat: c[1], lon: c[0] }));
+    let totalDist = 0;
+    for (let i = 0; i < routeCoords.length - 1; i++) {
+        totalDist += haversineDistance(routeCoords[i], routeCoords[i+1]);
+    }
+    return totalDist;
+  }, [selectedRoute]);
+
+  const onMapClickRef = useRef(onMapClick);
+  useEffect(() => {
+    onMapClickRef.current = onMapClick;
+  });
+  
+  const onNavigationUpdateRef = useRef(onNavigationUpdate);
+  useEffect(() => {
+    onNavigationUpdateRef.current = onNavigationUpdate;
+  });
+  
+  const onProximityAlertRef = useRef(onProximityAlert);
+  useEffect(() => {
+    onProximityAlertRef.current = onProximityAlert;
+  });
+
+  // Initialize map
+  useEffect(() => {
+    if (leafletMap.current === null && mapRef.current) {
+      leafletMap.current = L.map(mapRef.current, {
+        center: [9.35, 76.6],
+        zoom: 9,
+      });
+
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+      }).addTo(leafletMap.current);
+      
+      routeLayers.current = L.layerGroup().addTo(leafletMap.current);
+      blackSpotsLayer.current = L.layerGroup().addTo(leafletMap.current);
+      stopsLayer.current = L.layerGroup().addTo(leafletMap.current);
+
+       const handleZoomEnd = () => {
+        if (!leafletMap.current || !blackSpotsLayer.current) return;
+        const map = leafletMap.current;
+        const layer = blackSpotsLayer.current;
+
+        if (map.getZoom() >= 12) {
+          if (!map.hasLayer(layer)) map.addLayer(layer);
+        } else {
+          if (map.hasLayer(layer)) map.removeLayer(layer);
+        }
+      }
+
+      leafletMap.current.on('click', (e) => {
+        onMapClickRef.current(e.latlng);
+      });
+      
+      leafletMap.current.on('zoomend', handleZoomEnd);
+
+      // Initial check
+      handleZoomEnd();
+    }
+    
+    const map = leafletMap.current;
+    return () => {
+      if (map) {
+        map.remove();
+        leafletMap.current = null;
+      }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Handle locating the user (one-shot)
+  useEffect(() => {
+    if (locateUser && leafletMap.current) {
+      leafletMap.current.locate({ setView: true, maxZoom: 16 });
+
+      const onLocationFound = (e: L.LocationEvent) => {
+        if (userLocationMarker.current) {
+          userLocationMarker.current.setLatLng(e.latlng);
+        } else {
+          userLocationMarker.current = L.marker(e.latlng).addTo(leafletMap.current!)
+            .bindPopup("You are here").openPopup();
+        }
+      }
+
+      const onLocationError = (e: L.ErrorEvent) => {
+        onMapError("GPS location not found.");
+      }
+
+      leafletMap.current.on('locationfound', onLocationFound);
+      leafletMap.current.on('locationerror', onLocationError);
+
+      return () => {
+        leafletMap.current?.off('locationfound', onLocationFound);
+        leafletMap.current?.off('locationerror', onLocationError);
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locateUser]);
+
+  // Handle panning to the start of the route
+  useEffect(() => {
+    if (panToStart && leafletMap.current && startMarker.current) {
+      const startLatLng = startMarker.current.getLatLng();
+      leafletMap.current.setView(startLatLng, 16, { animate: true });
+    }
+  }, [panToStart]);
+
+  // Handle real-time navigation tracking
+  useEffect(() => {
+    const map = leafletMap.current;
+    if (!map) return;
+    
+    const selectedRouteRef = { current: selectedRoute };
+    selectedRouteRef.current = selectedRoute;
+
+    const totalHaversineDistanceRef = { current: totalHaversineDistance };
+    totalHaversineDistanceRef.current = totalHaversineDistance;
+
+    const onNavLocationFound = (e: L.LocationEvent) => {
+        const { latlng, heading, speed } = e;
+        
+        let userIcon;
+
+        if (heading !== null && !isNaN(heading) && speed && speed > 0.5) { // Only show arrow when moving
+             userIcon = L.divIcon({
+                html: `
+                    <div style="transform: rotate(${heading}deg); transform-origin: center; background: transparent; border: none;" class="transition-transform duration-500 ease-linear">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24">
+                           <polygon points="12 2 19 21 12 17 5 21 12 2" fill="#3b82f6" stroke="#ffffff" stroke-width="1.5" style="filter: drop-shadow(0 2px 3px rgba(0,0,0,0.5));"></polygon>
+                        </svg>
+                    </div>
+                `,
+                className: '',
+                iconSize: [32, 32],
+                iconAnchor: [16, 16],
+            });
+        } else {
+             userIcon = L.divIcon({
+                html: `
+                    <div class="relative flex items-center justify-center">
+                        <div class="absolute w-6 h-6 bg-blue-500 rounded-full animate-ping opacity-75"></div>
+                        <div class="relative w-4 h-4 bg-blue-500 rounded-full border-2 border-white shadow-md"></div>
+                    </div>
+                `,
+                className: '',
+                iconSize: [24, 24],
+                iconAnchor: [12, 12],
+            });
+        }
+       
+        if (userLocationMarker.current) {
+            userLocationMarker.current.setLatLng(latlng).setIcon(userIcon);
+        } else {
+            userLocationMarker.current = L.marker(latlng, { icon: userIcon }).addTo(map);
+        }
+        
+        // --- Proximity Alert Check ---
+        blackSpots.forEach(spot => {
+            const distance = haversineDistance({ lat: latlng.lat, lon: latlng.lng }, { lat: spot.lat, lon: spot.lng });
+
+            if (distance <= PROXIMITY_ALERT_THRESHOLD && !alertedSpotsRef.current.has(spot.id)) {
+                onProximityAlertRef.current(spot);
+                alertedSpotsRef.current.add(spot.id);
+            }
+        });
+
+
+        // --- Navigation Data Calculation ---
+        const currentRoute = selectedRouteRef.current;
+        if (!currentRoute) {
+            onNavigationUpdateRef.current(null);
+            return;
+        }
+
+        const userLatLng = e.latlng;
+        const currentSpeedMs = e.speed || 0; // meters/second
+        const routeCoords = currentRoute.geometry.coordinates.map((c: number[]) => ({ lat: c[1], lon: c[0] }));
+
+        const SEARCH_WINDOW = 30;
+        const searchStart = lastPassedIndex.current;
+        const searchEnd = Math.min(searchStart + SEARCH_WINDOW, routeCoords.length);
+
+        let newClosestPointIndex = -1;
+        let minDistance = Infinity;
+
+        for (let i = searchStart; i < searchEnd; i++) {
+            const dist = haversineDistance({ lat: userLatLng.lat, lon: userLatLng.lng }, routeCoords[i]);
+            if (dist < minDistance) {
+                minDistance = dist;
+                newClosestPointIndex = i;
+            }
+        }
+        
+        if (newClosestPointIndex !== -1) {
+            lastPassedIndex.current = newClosestPointIndex;
+        }
+        const closestPointIndex = lastPassedIndex.current;
+
+        let remainingHaversineDistance = 0;
+        for (let i = closestPointIndex; i < routeCoords.length - 1; i++) {
+            remainingHaversineDistance += haversineDistance(routeCoords[i], routeCoords[i+1]);
+        }
+
+        const totalRouteDistance = currentRoute.distance;
+        const remainingRouteDistance = totalHaversineDistanceRef.current > 0 
+            ? (remainingHaversineDistance / totalHaversineDistanceRef.current) * totalRouteDistance 
+            : 0;
+
+        const avgSpeed = totalRouteDistance / currentRoute.duration;
+        const speedForCalc = currentSpeedMs > 1 ? currentSpeedMs : avgSpeed;
+        const remainingTime = speedForCalc > 0 ? remainingRouteDistance / speedForCalc : 0;
+        
+        onNavigationUpdateRef.current({
+            speed: currentSpeedMs * 3.6, // km/h
+            remainingTime, // seconds
+            remainingDistance: remainingRouteDistance, // meters
+        });
+    };
+
+    const onNavLocationError = (e: L.ErrorEvent) => {
+        onMapError("Navigation failed: Could not get GPS location or permission denied.");
+        onNavigationUpdateRef.current(null);
+    };
+
+    if (isNavigating) {
+        lastPassedIndex.current = 0;
+        alertedSpotsRef.current.clear();
+        map.on('locationfound', onNavLocationFound);
+        map.on('locationerror', onNavLocationError);
+        map.locate({ watch: true, setView: true, maxZoom: 18, enableHighAccuracy: true });
+    } else {
+        map.stopLocate();
+        map.off('locationfound', onNavLocationFound);
+        map.off('locationerror', onNavLocationError);
+        if (userLocationMarker.current) {
+            map.removeLayer(userLocationMarker.current);
+            userLocationMarker.current = null;
+        }
+        onNavigationUpdateRef.current(null);
+    }
+
+    return () => {
+        if (map) {
+            map.stopLocate();
+            map.off('locationfound', onNavLocationFound);
+            map.off('locationerror', onNavLocationError);
+        }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isNavigating, onMapError, selectedRoute, totalHaversineDistance, blackSpots]);
+  
+  // Update stop markers
+  useEffect(() => {
+    if (!leafletMap.current || !stopsLayer.current) return;
+    stopsLayer.current.clearLayers();
+
+    stops.forEach((stop, index) => {
+      const stopIcon = L.divIcon({
+        html: `
+          <div class="relative flex items-center justify-center">
+            <div class="absolute w-6 h-6 bg-blue-600 rounded-full opacity-30 animate-pulse"></div>
+            <div class="relative w-5 h-5 bg-blue-600 text-white text-xs font-bold rounded-full flex items-center justify-center border-2 border-white shadow-md">${index + 1}</div>
+          </div>
+        `,
+        className: '',
+        iconSize: [24, 24],
+        iconAnchor: [12, 12],
+      });
+      L.marker([stop.lat, stop.lng], { icon: stopIcon })
+        .bindPopup(`Stop ${index + 1}`)
+        .addTo(stopsLayer.current!);
+    });
+  }, [stops]);
+
+  // Update black spots
+  useEffect(() => {
+    if (!leafletMap.current || !blackSpotsLayer.current) return;
+    
+    blackSpotsLayer.current.clearLayers();
+    
+    blackSpots.forEach((spot) => {
+      const icon = createWarningIcon(spot.risk_level, spot.report_count);
+
+      const popupContent = `
+        <div class="p-2 text-sm max-w-xs">
+          <h3 class="font-bold mb-1 ${spot.risk_level === 'High' ? 'text-red-600' : 'text-orange-600'}">⚠️ ${spot.risk_level} Risk Zone</h3>
+          <p class="mb-2">${spot.accident_history}</p>
+          <div class="text-xs text-slate-500 dark:text-slate-400 mb-2 border-t border-slate-200 dark:border-slate-700 pt-2">Reported by <strong>${spot.report_count}</strong> user(s).</div>
+          ${isAdmin ? `<div id="delete-container-${spot.id}" class="mt-2"><button class="w-full text-center text-xs font-medium text-red-500 hover:text-red-700 p-2 rounded bg-red-50 hover:bg-red-100 dark:bg-red-900/20 dark:hover:bg-red-900/40 transition-colors">Remove Spot</button></div>` : ''}
+        </div>
+      `;
+
+      const marker = L.marker([spot.lat, spot.lng], { icon })
+        .bindPopup(popupContent, { minWidth: 200 })
+        .addTo(blackSpotsLayer.current!);
+
+      marker.on('popupopen', (e) => {
+        if (isAdmin) {
+          const btn = e.popup.getElement()?.querySelector(`#delete-container-${spot.id} button`);
+          if (btn) {
+            btn.addEventListener('click', () => {
+              onSpotDeleteRequest(spot);
+              leafletMap.current?.closePopup();
+            });
+          }
+        }
+      });
+    });
+  }, [blackSpots, isAdmin, onSpotDeleteRequest]);
+
+  const calculateRisk = useCallback((route: any) => {
+      const coordinates = route.geometry.coordinates.map((c: number[]) => [c[1], c[0]] as [number, number]);
+      let riskScore = 0;
+      const detectedSpots = new Set<BlackSpot>();
+
+      coordinates.forEach((point: [number, number]) => {
+        (blackSpots || []).forEach(spot => {
+          if (detectedSpots.has(spot)) return;
+          const dist = haversineDistance({ lat: spot.lat, lon: spot.lng }, { lat: point[0], lon: point[1] });
+          if (dist < COLLISION_THRESHOLD) {
+            riskScore += (spot.risk_level === 'High' ? 10 : 5);
+            detectedSpots.add(spot);
+          }
+        });
+      });
+      return { riskScore, detectedSpots };
+  }, [blackSpots]);
+
+  // Fetch and score routes based on start/end locations
+  useEffect(() => {
+    const fetchRoutes = async () => {
+      setRoutes([]);
+      setSelectedRouteIndex(0);
+      onRouteDetails(null);
+      onSafetyBriefing(null);
+      onRerouteInfo(null);
+      
+      if ((typeof startLocation === 'string' && !startLocation.trim()) || !endLocation.trim()) {
+        if (routeLayers.current) routeLayers.current.clearLayers();
+        if (startMarker.current && leafletMap.current) leafletMap.current.removeLayer(startMarker.current);
+        if (endMarker.current && leafletMap.current) leafletMap.current.removeLayer(endMarker.current);
+        if (stopsLayer.current) stopsLayer.current.clearLayers();
+        return;
+      }
+
+      if (!leafletMap.current) return;
+      
+      onLoading(true);
+      onMapError("");
+
+      if (routeLayers.current) routeLayers.current.clearLayers();
+      if (startMarker.current) leafletMap.current.removeLayer(startMarker.current);
+      if (endMarker.current) leafletMap.current.removeLayer(endMarker.current);
+      
+      try {
+        const provider = new OpenStreetMapProvider();
+        
+        let startRes;
+        if (typeof startLocation === 'string') {
+          startRes = await provider.search({ query: startLocation });
+        } else {
+           startRes = [{ x: startLocation.lng, y: startLocation.lat, label: 'My Current Location' }];
+        }
+        
+        const endRes = await provider.search({ query: endLocation });
+
+        if (!startRes.length || !endRes.length) {
+          throw new Error("One or both locations could not be found.");
+        }
+
+        const sCoords: [number, number] = [startRes[0].y, startRes[0].x];
+        const eCoords: [number, number] = [endRes[0].y, endRes[0].x];
+        
+        startMarker.current = L.marker(sCoords).addTo(leafletMap.current).bindPopup(startRes[0].label);
+        endMarker.current = L.marker(eCoords).addTo(leafletMap.current).bindPopup(endRes[0].label);
+
+        const profile = travelMode === 'car' ? 'driving' : 'biking';
+        
+        const waypoints = [
+          [sCoords[1], sCoords[0]], // OSRM wants lon, lat
+          ...stops.map(s => [s.lng, s.lat]),
+          [eCoords[1], eCoords[0]]
+        ];
+        const waypointsString = waypoints.map(c => c.join(',')).join(';');
+        const alternativesEnabled = stops.length === 0;
+
+        const url = `https://router.project-osrm.org/route/v1/${profile}/${waypointsString}?geometries=geojson&alternatives=${alternativesEnabled}&overview=full`;
+        const res = await fetch(url);
+        const json = await res.json();
+
+        if (!json.routes || !json.routes.length) {
+          throw new Error("No route could be found between the locations.");
+        }
+        
+        if (alternativesEnabled) {
+            const routesWithInfo = json.routes.map((route: any, index: number) => {
+                const { riskScore, detectedSpots } = calculateRisk(route);
+                return {
+                ...route,
+                id: index,
+                riskScore,
+                detectedSpots,
+                };
+            });
+
+            const sortedBySafety = [...routesWithInfo].sort((a: any, b: any) => {
+                if (a.riskScore !== b.riskScore) return a.riskScore - b.riskScore;
+                return a.duration - b.duration;
+            });
+
+            const sortedByTime = [...routesWithInfo].sort((a: any, b: any) => a.duration - b.duration);
+            
+            const safestRoute = sortedBySafety[0];
+            const fastestRoute = sortedByTime[0];
+
+            if (safestRoute && fastestRoute && safestRoute.id !== fastestRoute.id && safestRoute.riskScore < fastestRoute.riskScore) {
+                const timeDifference = safestRoute.duration - fastestRoute.duration;
+                const spotsDifference = fastestRoute.detectedSpots.size - safestRoute.detectedSpots.size;
+                
+                onRerouteInfo({
+                    timeDifference: timeDifference,
+                    spotsAvoided: spotsDifference,
+                });
+            } else {
+                onRerouteInfo(null);
+            }
+            setRoutes(sortedBySafety);
+        } else {
+            const { riskScore, detectedSpots } = calculateRisk(json.routes[0]);
+            const routeWithScore = { ...json.routes[0], id: 0, riskScore, detectedSpots };
+            setRoutes([routeWithScore]);
+            onRerouteInfo(null);
+        }
+
+        setSelectedRouteIndex(0);
+
+      } catch (e: any) {
+        console.error("Routing error:", e);
+        setRoutes([]);
+        onMapError(e.message || "An unknown error occurred during routing.");
+      } finally {
+        onLoading(false);
+      }
+    };
+
+    fetchRoutes();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startLocation, endLocation, travelMode, blackSpots, stops, calculateRisk]);
+
+  // Draw/update routes when they or selection changes
+  useEffect(() => {
+    lastPassedIndex.current = 0; // Reset progress when route changes
+    if (!leafletMap.current || !routeLayers.current) return;
+
+    routeLayers.current.clearLayers();
+
+    if (routes.length === 0) {
+      onRouteDetails(null);
+      return;
+    }
+    
+    // Find the selected route based on its original ID after sorting
+    const selectedRoute = routes[selectedRouteIndex];
+
+    // Draw alternative routes first, so the selected one is on top and more prominent
+    routes.forEach((route, index) => {
+      if (index === selectedRouteIndex) return;
+      const coordinates = route.geometry.coordinates.map((c: number[]) => [c[1], c[0]] as [number, number]);
+      const polyline = L.polyline(coordinates, alternativeRouteStyle).addTo(routeLayers.current!);
+      polyline.on('click', () => {
+        setSelectedRouteIndex(index);
+      });
+    });
+
+    // Draw the selected route last, so it's on top
+    if (selectedRoute) {
+      const coordinates = selectedRoute.geometry.coordinates.map((c: number[]) => [c[1], c[0]] as [number, number]);
+      L.polyline(coordinates, primaryRouteStyle).addTo(routeLayers.current!);
+    }
+    
+    if (!selectedRoute) {
+      onRouteDetails(null);
+      return;
+    }
+
+    const coordinates = selectedRoute.geometry.coordinates.map((c: number[]) => [c[1], c[0]] as [number, number]);
+    const bounds = L.latLngBounds(coordinates);
+    leafletMap.current.fitBounds(bounds, { padding: [50, 50] });
+
+    onRouteDetails(selectedRoute);
+    
+    const runSafetyAnalysis = async () => {
+      onSafetyBriefing(null); // Clear previous briefing
+      onLoading(true);
+      try {
+        const briefing = await getSafetyBriefing(Array.from(selectedRoute.detectedSpots));
+        onSafetyBriefing(briefing);
+      } catch (e) {
+        console.error("Safety briefing error:", e);
+        onSafetyBriefing('Could not retrieve safety briefing.');
+      } finally {
+        onLoading(false);
+      }
+    };
+
+    runSafetyAnalysis();
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [routes, selectedRouteIndex]);
+
+
+  return <div ref={mapRef} className="h-full w-full z-0" />;
+};
+
+export default MapComponent;
